@@ -29,6 +29,8 @@ export function createDeviceView(ctx) {
       codec: m.codec,
       capabilities: m.capabilities,
       state: propertyState(dev), // live property values ({ battery: 74, motion: false, … })
+      ...decodedReadings(dev, m),
+      decodedProperties: decodedProperties(dev, m),
       stream: isCamera ? `/stream/${m.sn}` : undefined,
       streaming: isCamera ? streaming.has(m.sn) : undefined, // live P2P feed active right now?
       canReboot: m.codec === "station", // HomeBase-only; drives a Reboot button in HA
@@ -40,6 +42,53 @@ export function createDeviceView(ctx) {
     const out = {};
     for (const [name, pv] of Object.entries(dev.getProperties())) out[name] = pv.value;
     return out;
+  }
+
+  /** Read only the getters named by the SDK manifest; never invoke an action or setter. */
+  function decodedReadings(dev, manifest = dev.describe()) {
+    const errors = [];
+    const decodedState = Object.fromEntries(
+      (manifest.details ?? []).map((cap) => {
+        const surface = dev[cap.accessor]?.();
+        return [
+          cap.accessor,
+          Object.fromEntries(
+            cap.reads.map((read) => {
+              let value;
+              try {
+                value = surface?.[read.accessor];
+                if (
+                  value != null &&
+                  typeof value !== "string" &&
+                  typeof value !== "boolean" &&
+                  !(typeof value === "number" && Number.isFinite(value))
+                ) {
+                  errors.push({ capability: cap.accessor, accessor: read.accessor, error: "non_scalar" });
+                  value = undefined;
+                }
+              } catch {
+                // Keep raw state available if an optional decoder fails. Never expose exception data.
+                errors.push({ capability: cap.accessor, accessor: read.accessor, error: "read_failed" });
+              }
+              return [read.accessor, value ?? null];
+            }),
+          ),
+        ];
+      }),
+    );
+    return { decodedState, ...(errors.length ? { decodedErrors: errors } : {}) };
+  }
+
+  /** Keep the SDK's read metadata and capability namespaces, without re-deriving a second schema. */
+  function decodedProperties(dev, manifest = dev.describe()) {
+    return {
+      bound: manifest.bound,
+      details: (manifest.details ?? []).map(({ capability, accessor, reads }) => ({
+        capability,
+        accessor,
+        reads,
+      })),
+    };
   }
 
   /**
@@ -105,5 +154,5 @@ export function createDeviceView(ctx) {
     );
   }
 
-  return { describeDevice, propertyState, propertySpecs, deviceList };
+  return { describeDevice, propertyState, propertySpecs, decodedProperties, deviceList };
 }
