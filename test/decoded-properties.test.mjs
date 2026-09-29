@@ -37,7 +37,7 @@ test("published SDK decodes recording quality while raw state and raw schema sta
   assert.equal(summary.decodedState.camera.recordingQuality, 2);
   assert.deepEqual(api.propertySpecs(dev), properties);
   const manifest = api.decodedProperties(dev);
-  assert.deepEqual(summary.decodedProperties, manifest);
+  assert.equal(Object.hasOwn(summary, "decodedProperties"), false);
   const read = manifest.details
     .find((cap) => cap.accessor === "camera")
     .reads.find((r) => r.property === "recordingQuality");
@@ -172,12 +172,12 @@ test("snapshot and schema follow replaced models rather than a stale projection 
   const replaced = await api.describeDevice(sn);
   assert.equal(Object.hasOwn(replaced.decodedState.camera, "recordingQuality"), false);
   assert.equal(
-    replaced.decodedProperties.details.some((c) => c.reads.some((r) => r.property === "recordingQuality")),
+    api.decodedProperties(current).details.some((c) => c.reads.some((r) => r.property === "recordingQuality")),
     false,
   );
 });
 
-test("a snapshot binds decoded values and metadata to one manifest evaluation", async () => {
+test("a snapshot evaluates the read manifest once without repeating metadata", async () => {
   const dev = camera();
   const describe = dev.describe.bind(dev);
   let calls = 0;
@@ -186,12 +186,9 @@ test("a snapshot binds decoded values and metadata to one manifest evaluation", 
     return describe();
   };
   const snapshot = await view(dev).describeDevice(sn);
-  const cap = snapshot.decodedProperties.details.find((c) => c.accessor === "camera");
-  assert.equal(snapshot.decodedState[cap.accessor].recordingQuality, 2);
-  assert.equal(
-    cap.reads.some((r) => r.accessor === "recordingQuality"),
-    true,
-  );
+  assert.equal(snapshot.decodedState.camera.recordingQuality, 2);
+  assert.equal(Object.hasOwn(snapshot, "decodedProperties"), false);
+  assert.equal(calls, 1);
 });
 
 test("WebSocket schema-1 replies add decoded fields without changing legacy fields or bypassing auth", async () => {
@@ -229,7 +226,8 @@ test("WebSocket schema-1 replies add decoded fields without changing legacy fiel
     assert.deepEqual(snapshot.device, list.devices[0]);
     assert.deepEqual(snapshot.device.state, ctx.propertyState(dev));
     assert.equal(snapshot.device.decodedState.camera.recordingQuality, 2);
-    assert.deepEqual(snapshot.device.decodedProperties, properties.decodedProperties);
+    assert.equal(Object.hasOwn(snapshot.device, "decodedProperties"), false);
+    assert.equal(Object.hasOwn(list.devices[0], "decodedProperties"), false);
   } finally {
     server.close();
   }

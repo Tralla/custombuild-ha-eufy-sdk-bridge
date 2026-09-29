@@ -30,7 +30,6 @@ export function createDeviceView(ctx) {
       capabilities: m.capabilities,
       state: propertyState(dev), // live property values ({ battery: 74, motion: false, … })
       ...decodedReadings(dev, m),
-      decodedProperties: decodedProperties(dev, m),
       stream: isCamera ? `/stream/${m.sn}` : undefined,
       streaming: isCamera ? streaming.has(m.sn) : undefined, // live P2P feed active right now?
       canReboot: m.codec === "station", // HomeBase-only; drives a Reboot button in HA

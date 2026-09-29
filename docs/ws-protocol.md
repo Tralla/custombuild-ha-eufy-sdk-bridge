@@ -136,8 +136,7 @@ decoder or a replacement for raw `state`. For example, a camera can report:
 }
 ```
 
-Each snapshot includes matching `decodedProperties` metadata from the same model manifest (below).
-`device.properties` also supplies it for clients requesting metadata separately. Join by capability
+`device.properties` supplies `decodedProperties` metadata (below); snapshots do not repeat it. Join by capability
 `accessor` and read `accessor`; `read.property` is the SDK's flat raw-property name. Keeping both
 namespaces avoids discarding a read when multiple capabilities use the same property name.
 
@@ -195,10 +194,11 @@ from `state` (same `name`).
 
 The response also includes `decodedProperties: { bound, details }`. Each detail retains the SDK's
 `capability`, `accessor` and `reads` descriptors without re-deriving types or enum labels. `bound: false`
-and empty `details` distinguish an unbound model from a bound surface with no reads. Snapshots carry
-their own matching metadata, so clients need not cache a separate metadata response to interpret
-them. Evidence can add reads that were not installed earlier. Clients requesting metadata separately
-must re-fetch it when the device model changes.
+and empty `details` distinguish an unbound model from a bound surface with no reads. Cache this
+metadata between polls, and re-fetch after reconnecting or when the model, capabilities, or exposed
+`decodedState` accessor keys change. Evidence can install new reads during a session. Values and
+metadata are separate requests, not an atomic pair; discard metadata from a previous connection and
+leave unmatched reads unknown until refreshed. Changing scalar values does not require a new manifest.
 
 For example, the camera descriptor for recording quality has `accessor: "recordingQuality"`,
 `property: "recordingQuality"`, `type: "string"`, `kind: "enum"`, `values: [1, 2, 3]` and the SDK's
