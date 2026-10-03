@@ -123,6 +123,38 @@ Every device the account exposes. _(Requires `auth.state == "ok"`.)_
 - `canReboot` is `true` on HomeBase/station devices, which accept `device.reboot`.
 - A device that failed to resolve appears as `{ "sn": "…", "error": "…" }`.
 
+#### Decoded readings (additive, schema 1)
+
+Each summary also includes `decodedState`, grouped by the SDK capability accessor and then its read
+accessor. These are the values of the getters named by `dev.describe().details[].reads`, not another
+decoder or a replacement for raw `state`. For example, a camera can report:
+
+```json
+{
+  "state": { "recordingQuality": { "cur_mode": 0, "mode_0": { "quality": 2 } } },
+  "decodedState": { "camera": { "recordingQuality": 2 } }
+}
+```
+
+`device.properties` supplies `decodedProperties` metadata (below); snapshots do not repeat it. Join by capability
+`accessor` and read `accessor`; `read.property` is the SDK's flat raw-property name. Keeping both
+namespaces avoids discarding a read when multiple capabilities use the same property name.
+
+An installed read without a usable value is `null`. A read absent from the SDK manifest is omitted;
+that means the current bound surface does not expose it, not proof the hardware cannot support it.
+Values are strings, booleans or finite numbers; `false`, `0` and the empty string are retained.
+If a getter throws or returns a non-scalar, that entry is `null` and `decodedErrors` contains
+`{ capability, accessor, error }`, where `error` is `read_failed` or `non_scalar`. Exception text and
+payloads are not included. `decodedErrors` is absent on a clean read.
+
+Snapshot reads retain the SDK's normal stale-read background refresh policy; these fields do not
+promise a synchronous device confirmation or a no-refresh read. No decoded event stream is added,
+and existing event payloads are unchanged. A consumer opting into these fields must refresh its
+snapshot as appropriate; it must not overwrite decoded values with raw property payloads.
+
+Older clients can ignore the new fields and continue using `state` and `properties`. This addition
+does not by itself change Home Assistant entities or fix their displayed values.
+
 ### `device.state`
 
 The same shape as one `devices.list` entry, for a single device (identity + capabilities + live `state`). _(Requires auth.)_
@@ -160,6 +192,21 @@ Map an entry to an entity: `writable` + `bool` → **switch**, `enum` → **sele
 `number` → **number** (`unit`/`kind` for display), everything else → **sensor**. Pair with the live value
 from `state` (same `name`).
 
+The response also includes `decodedProperties: { bound, details }`. Each detail retains the SDK's
+`capability`, `accessor` and `reads` descriptors without re-deriving types or enum labels. `bound: false`
+and empty `details` distinguish an unbound model from a bound surface with no reads. Cache this
+metadata between polls, and re-fetch after reconnecting or when the model, capabilities, or exposed
+`decodedState` accessor keys change. Evidence can install new reads during a session. Values and
+metadata are separate requests, not an atomic pair; discard metadata from a previous connection and
+leave unmatched reads unknown until refreshed. Changing scalar values does not require a new manifest.
+
+For example, the camera descriptor for recording quality has `accessor: "recordingQuality"`,
+`property: "recordingQuality"`, `type: "string"`, `kind: "enum"`, `values: [1, 2, 3]` and the SDK's
+`labels` map. **`type` describes SDK storage**, while `kind`, `values` and `labels` describe the decoded
+reading. Do not infer the decoded value's type from storage alone. `writable` describes the setter
+installed beside the read; this addition does not introduce a new write route or change write
+validation. The original flat `properties` array and its pairing with raw `state` remain unchanged.
+
 ### `device.set`
 
 Write a property (maps to the SDK's `setProperty`). The valid `name`s are the writable properties a
@@ -178,19 +225,33 @@ device's capabilities expose (e.g. `statusLed`, `nightVision`, guard-mode `mode`
 
 Invoke a capability **action** — a typed method that is not a scalar property, so `device.set` cannot
 reach it. `{ sn, action, args? }`, where `args` is the positional argument list. Only methods a
-capability surface exposes are reachable; today those surfaces are `smart_light`, `camera`, `lock` and
-`siren`. _(Requires auth.)_
+capability surface exposes are reachable; today those surfaces are `smart_light`, `camera`, `lock`,
+`siren` and `ptz`. _(Requires auth.)_
+
+A **dotted** `action` walks a sub-API namespace: every segment before the last one hands back a
+namespace without acting (so it takes no arguments), and only the final segment receives `args`.
+`preset.goto` is therefore `dev.ptz().preset().goto(id)`.
 
 ```jsonc
-// sound the alarm for 10 s — a HomeBase, or a camera attached to one
-{ "id": 9, "cmd": "device.action", "sn": "EXAMPLE-CAM-0001", "action": "trigger", "args": [10] }
+// one pan-tilt step — the four verbs are `left` / `right` / `up` / `down`, all no-arg →
+{ "id": 7, "cmd": "device.action", "sn": "EXAMPLE-CAM-0001", "action": "left" }
 // ←
-{ "id": 9, "ok": true, "result": null }
-// stop it before the duration runs out
+{ "id": 7, "ok": true, "result": null }
+// move to stored preset 3 →
+{ "id": 8, "cmd": "device.action", "sn": "EXAMPLE-CAM-0001", "action": "preset.goto", "args": [3] }
+// sound the alarm for 10 s — a HomeBase, or a camera attached to one →
+{ "id": 9, "cmd": "device.action", "sn": "EXAMPLE-CAM-0001", "action": "trigger", "args": [10] }
+// stop it before the duration runs out →
 { "id": 10, "cmd": "device.action", "sn": "EXAMPLE-CAM-0001", "action": "stop" }
 // no surface on this device carries the verb →
-{ "id": 11, "ok": false, "error": "no action 'trigger' on EXAMPLE-CAM-0002" }
+{ "id": 11, "ok": false, "error": "no action 'calibrate' on EXAMPLE-CAM-0002" }
 ```
+
+PTZ movement is **fire-and-forget**: P2P sends no acknowledgement, so `ok: true` means the frame left
+for the camera, not that it finished moving. Where the camera ended up arrives separately as a
+`ptzNotify` event. The preset write verbs are fire-and-forget the same way, and referencing an **empty
+slot is a silent no-op** — `goto`/`save`/`delete` on an unpopulated id do nothing and report no error.
+Only cameras whose `capabilities` include `ptz` carry these verbs.
 
 The siren verbs install only where the SDK has evidence for a wire: a HomeBase reporting hub-alarm
 params, a camera attached to one that reports the EAS slot, or a standalone siren (`stop` only, plus
@@ -395,7 +456,12 @@ raw video protocol.
 
 ## Not yet exposed
 
-- Capability **action** verbs beyond the surfaces `device.action` routes today (PTZ move, talkback).
+- Capability **action** verbs beyond the surfaces `device.action` routes today (e.g. talkback).
+- PTZ **zoom** (`zoom`) and the preset **read** verbs (`preset.list` / `preset.image`): both exist on
+  the SDK surface and `device.action` would route them, but zoom needs a second telephoto lens and the
+  read verbs answer over P2P request/reply, so neither is exercised here yet.
+- Raw P2P command ids that the SDK never promotes to a capability member — pan **calibration**
+  (`CMD_INDOOR_PAN_CALIBRATION` 6017 / `CMD_OUTDOOR_PAN_CALIBRATION` 6251) is the notable one.
 - Guard / station security mode (arm home/away/disarm).
 - Per-device event subscription/filtering (events broadcast to all clients).
 - Audio / recording / timelapse.
