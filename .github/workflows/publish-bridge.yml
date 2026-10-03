@@ -1,0 +1,255 @@
+name: Publish custom Bridge image
+
+on:
+  workflow_dispatch:
+    inputs:
+      bridge_base_sha:
+        description: Exact public Bridge base commit in Tralla/ha-eufy-sdk-bridge
+        required: true
+        type: string
+      bridge_patch_shas:
+        description: Ordered public Bridge patch commits, separated by whitespace (empty if none)
+        required: false
+        type: string
+      bridge_candidate_tree:
+        description: Exact accepted Bridge candidate Git tree ID
+        required: true
+        type: string
+      sdk_sha:
+        description: Exact public SDK commit in Tralla/eufy-sdk
+        required: true
+        type: string
+      sdk_version:
+        description: Accepted @mega-yfue/eufy-sdk package version
+        required: true
+        type: string
+      image_tag:
+        description: New immutable GHCR image tag
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: publish-bridge
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'Tralla/custombuild-ha-eufy-sdk-bridge' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      BRIDGE_BASE_SHA: ${{ inputs.bridge_base_sha }}
+      BRIDGE_PATCH_SHAS: ${{ inputs.bridge_patch_shas }}
+      BRIDGE_CANDIDATE_TREE: ${{ inputs.bridge_candidate_tree }}
+      SDK_SHA: ${{ inputs.sdk_sha }}
+      SDK_VERSION: ${{ inputs.sdk_version }}
+      IMAGE_TAG: ${{ inputs.image_tag }}
+      IMAGE_NAME: ghcr.io/tralla/custombuild-ha-eufy-sdk-bridge
+
+    steps:
+      - name: Check out distribution repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate immutable inputs and destination
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          sha = re.compile(r"[0-9a-fA-F]{40}\Z")
+          version = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?\Z")
+          image_tag = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+          values = {
+              "bridge_base_sha": os.environ["BRIDGE_BASE_SHA"],
+              "bridge_candidate_tree": os.environ["BRIDGE_CANDIDATE_TREE"],
+              "sdk_sha": os.environ["SDK_SHA"],
+          }
+          for name, value in values.items():
+              if not sha.fullmatch(value):
+                  raise SystemExit(f"{name} must be a full 40-digit Git object ID")
+          if not version.fullmatch(os.environ["SDK_VERSION"]):
+              raise SystemExit("sdk_version must be a full numeric package version with optional prerelease")
+          if not image_tag.fullmatch(os.environ["IMAGE_TAG"]):
+              raise SystemExit("image_tag contains characters invalid for an OCI image tag")
+          pathlib.Path(os.environ["RUNNER_TEMP"], "bridge-patches.txt").write_text(
+              "".join(patch.lower() + "\n" for patch in os.environ["BRIDGE_PATCH_SHAS"].split()),
+              encoding="utf-8",
+          )
+          PY
+          if [[ "$(git remote get-url origin)" != "https://github.com/Tralla/custombuild-ha-eufy-sdk-bridge" &&
+                "$(git remote get-url origin)" != "https://github.com/Tralla/custombuild-ha-eufy-sdk-bridge.git" ]]; then
+            echo 'Refusing to publish outside the dedicated Bridge distribution repository' >&2
+            exit 1
+          fi
+          printf 'BRIDGE_PATCH_PROVENANCE=%s\n' "$(paste -sd, "$RUNNER_TEMP/bridge-patches.txt")" >>"$GITHUB_ENV"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.5.0'
+
+      - name: Reconstruct and package exact public SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_dir="$RUNNER_TEMP/sdk-source"
+          package_source="$RUNNER_TEMP/sdk-package-source"
+          artifact_dir="$RUNNER_TEMP/sdk-artifact"
+          git init -q "$source_dir"
+          git -C "$source_dir" remote add source https://github.com/Tralla/eufy-sdk.git
+          if ! git -C "$source_dir" fetch --no-tags source "$SDK_SHA"; then
+            echo "Could not fetch SDK commit from public source: $SDK_SHA" >&2
+            exit 1
+          fi
+          if [[ "$(git -C "$source_dir" cat-file -t "$SDK_SHA")" != commit ]]; then
+            echo "SDK object is not a commit: $SDK_SHA" >&2
+            exit 1
+          fi
+          git -C "$source_dir" remote remove source
+          git -C "$source_dir" checkout --detach "$SDK_SHA"
+          [[ "$(git -C "$source_dir" rev-parse HEAD)" == "${SDK_SHA,,}" ]] || {
+            echo 'SDK checkout did not resolve to the requested commit' >&2
+            exit 1
+          }
+          npm ci --no-audit --no-fund --prefix "$source_dir"
+          npm run verify --prefix "$source_dir"
+          mkdir -p "$package_source" "$artifact_dir"
+          git -C "$source_dir" archive HEAD | tar -x -C "$package_source"
+          cp -a "$source_dir/dist" "$package_source/dist"
+          npm pkg set "version=$SDK_VERSION" --prefix "$package_source" >/dev/null
+          (
+            cd "$package_source"
+            npm pack --json --pack-destination "$artifact_dir" >"$RUNNER_TEMP/sdk-pack.json"
+          )
+          artifact_name="$(node -e 'const r=JSON.parse(require("node:fs").readFileSync(process.argv[1])); process.stdout.write(r[0]?.filename || "")' "$RUNNER_TEMP/sdk-pack.json")"
+          [[ -n "$artifact_name" && -f "$artifact_dir/$artifact_name" ]] || {
+            echo 'SDK package artifact was not produced' >&2
+            exit 1
+          }
+          node -e 'const p=require(process.argv[1]); if(p.name!=="@mega-yfue/eufy-sdk" || p.version!==process.argv[2]) process.exit(1)' \
+            "$package_source/package.json" "$SDK_VERSION"
+          printf 'SDK artifact: %s\n' "$artifact_dir/$artifact_name"
+          printf 'SDK artifact SHA-256: %s\n' "$(sha256sum "$artifact_dir/$artifact_name" | awk '{print $1}')"
+          printf 'SDK_ARTIFACT=%s\n' "$artifact_dir/$artifact_name" >>"$GITHUB_ENV"
+
+      - name: Reconstruct exact public Bridge source
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_dir="$RUNNER_TEMP/bridge-source"
+          git init -q "$source_dir"
+          git -C "$source_dir" remote add source https://github.com/Tralla/ha-eufy-sdk-bridge.git
+          if ! git -C "$source_dir" fetch --no-tags source "$BRIDGE_BASE_SHA"; then
+            echo "Could not fetch Bridge base commit from public source: $BRIDGE_BASE_SHA" >&2
+            exit 1
+          fi
+          if [[ "$(git -C "$source_dir" cat-file -t "$BRIDGE_BASE_SHA")" != commit ]]; then
+            echo "Bridge base object is not a commit: $BRIDGE_BASE_SHA" >&2
+            exit 1
+          fi
+          while IFS= read -r patch; do
+            [[ -n "$patch" ]] || continue
+            if ! git -C "$source_dir" fetch --no-tags source "$patch"; then
+              echo "Could not fetch Bridge patch commit from public source: $patch" >&2
+              exit 1
+            fi
+            if [[ "$(git -C "$source_dir" cat-file -t "$patch")" != commit ]]; then
+              echo "Bridge patch object is not a commit: $patch" >&2
+              exit 1
+            fi
+            parents="$(git -C "$source_dir" rev-list --parents -n 1 "$patch")"
+            if [[ "$(wc -w <<<"$parents")" -gt 2 ]]; then
+              echo "Merge commit is not a replayable Bridge patch: $patch" >&2
+              exit 1
+            fi
+          done <"$RUNNER_TEMP/bridge-patches.txt"
+          git -C "$source_dir" remote remove source
+          git -C "$source_dir" checkout --detach "$BRIDGE_BASE_SHA"
+          git -C "$source_dir" config user.name 'github-actions[bot]'
+          git -C "$source_dir" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          while IFS= read -r patch; do
+            [[ -n "$patch" ]] || continue
+            if ! git -C "$source_dir" cherry-pick "$patch"; then
+              echo "Bridge patch replay failed: $patch" >&2
+              exit 1
+            fi
+          done <"$RUNNER_TEMP/bridge-patches.txt"
+          actual_tree="$(git -C "$source_dir" rev-parse 'HEAD^{tree}')"
+          if [[ "$actual_tree" != "${BRIDGE_CANDIDATE_TREE,,}" ]]; then
+            echo "Reconstructed Bridge tree mismatch: expected $BRIDGE_CANDIDATE_TREE, got $actual_tree" >&2
+            exit 1
+          fi
+          [[ "$(git -C "$source_dir" status --porcelain)" == '' ]] || {
+            echo 'Reconstructed Bridge source is not clean before SDK wiring' >&2
+            exit 1
+          }
+
+      - name: Wire the exact local SDK tarball into Bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_dir="$RUNNER_TEMP/bridge-source"
+          cp "$SDK_ARTIFACT" "$source_dir/eufy-sdk-local.tgz"
+          npm pkg set 'dependencies.@mega-yfue/eufy-sdk=file:./eufy-sdk-local.tgz' --prefix "$source_dir"
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund --prefix "$source_dir"
+          python3 - "$source_dir/Dockerfile" "$source_dir/Dockerfile.release" <<'PY'
+          from pathlib import Path
+          import sys
+
+          source = Path(sys.argv[1])
+          destination = Path(sys.argv[2])
+          text = source.read_text()
+          marker = "COPY package.json package-lock.json ./\n"
+          if text.count(marker) != 1:
+              raise SystemExit("upstream Dockerfile dependency layout changed; human build review required")
+          destination.write_text(text.replace(marker, marker + "COPY eufy-sdk-local.tgz ./\n", 1))
+          PY
+
+      - name: Validate reconstructed Bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_dir="$RUNNER_TEMP/bridge-source"
+          npm ci --no-audit --no-fund --prefix "$source_dir"
+          npm run lint --prefix "$source_dir"
+          npm test --prefix "$source_dir"
+          while IFS= read -r -d '' file; do
+            node --check "$source_dir/$file"
+          done < <(git -C "$source_dir" ls-files -z '*.mjs')
+
+      - name: Enable arm64 emulation (binfmt)
+        shell: bash
+        run: docker run --rm --privileged tonistiigi/binfmt --install arm64
+      - name: Create a buildx builder
+        shell: bash
+        run: docker buildx create --use --name eufy-ci --driver docker-container
+      - name: Log in to GHCR
+        shell: bash
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and publish Bridge image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --file "$RUNNER_TEMP/bridge-source/Dockerfile.release" \
+            --tag "$IMAGE_NAME:$IMAGE_TAG" \
+            --label 'org.opencontainers.image.title=Eufy custom Bridge' \
+            --label 'org.opencontainers.image.source=https://github.com/Tralla/ha-eufy-sdk-bridge' \
+            --label "io.eufy.bridge.base=$BRIDGE_BASE_SHA" \
+            --label "io.eufy.bridge.patch-shas=$BRIDGE_PATCH_PROVENANCE" \
+            --label "io.eufy.bridge.candidate-tree=$BRIDGE_CANDIDATE_TREE" \
+            --label "io.eufy.sdk.sha=$SDK_SHA" \
+            --label "io.eufy.sdk.version=$SDK_VERSION" \
+            --push \
+            "$RUNNER_TEMP/bridge-source"
