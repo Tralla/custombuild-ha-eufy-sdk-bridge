@@ -15,8 +15,20 @@ on:
         description: Exact accepted Bridge candidate Git tree ID
         required: true
         type: string
-      sdk_sha:
+      sdk_base_sha:
         description: Exact public SDK commit in Tralla/eufy-sdk
+        required: true
+        type: string
+      sdk_patch_shas:
+        description: Ordered public SDK patch commits, separated by whitespace (empty if none)
+        required: false
+        type: string
+      sdk_candidate_tree:
+        description: Exact accepted SDK candidate Git tree ID
+        required: true
+        type: string
+      sdk_patches_enabled:
+        description: Whether the accepted SDK composition includes maintained patches
         required: true
         type: string
       sdk_version:
@@ -45,7 +57,10 @@ jobs:
       BRIDGE_BASE_SHA: ${{ inputs.bridge_base_sha }}
       BRIDGE_PATCH_SHAS: ${{ inputs.bridge_patch_shas }}
       BRIDGE_CANDIDATE_TREE: ${{ inputs.bridge_candidate_tree }}
-      SDK_SHA: ${{ inputs.sdk_sha }}
+      SDK_BASE_SHA: ${{ inputs.sdk_base_sha }}
+      SDK_PATCH_SHAS: ${{ inputs.sdk_patch_shas }}
+      SDK_CANDIDATE_TREE: ${{ inputs.sdk_candidate_tree }}
+      SDK_PATCHES_ENABLED: ${{ inputs.sdk_patches_enabled }}
       SDK_VERSION: ${{ inputs.sdk_version }}
       IMAGE_TAG: ${{ inputs.image_tag }}
       IMAGE_NAME: ghcr.io/tralla/custombuild-ha-eufy-sdk-bridge
@@ -71,17 +86,31 @@ jobs:
           values = {
               "bridge_base_sha": os.environ["BRIDGE_BASE_SHA"],
               "bridge_candidate_tree": os.environ["BRIDGE_CANDIDATE_TREE"],
-              "sdk_sha": os.environ["SDK_SHA"],
+              "sdk_base_sha": os.environ["SDK_BASE_SHA"],
+              "sdk_candidate_tree": os.environ["SDK_CANDIDATE_TREE"],
           }
           for name, value in values.items():
               if not sha.fullmatch(value):
                   raise SystemExit(f"{name} must be a full 40-digit Git object ID")
           if not version.fullmatch(os.environ["SDK_VERSION"]):
               raise SystemExit("sdk_version must be a full numeric package version with optional prerelease")
+          patches = os.environ["SDK_PATCH_SHAS"].split()
+          for patch in patches:
+              if not sha.fullmatch(patch):
+                  raise SystemExit(f"invalid SDK patch SHA: {patch}")
+          enabled = os.environ["SDK_PATCHES_ENABLED"]
+          if enabled not in {"true", "false"}:
+              raise SystemExit("sdk_patches_enabled must be true or false")
+          if (enabled == "true") != bool(patches):
+              raise SystemExit("sdk_patches_enabled must be true exactly when SDK patch SHAs are supplied")
           if not image_tag.fullmatch(os.environ["IMAGE_TAG"]):
               raise SystemExit("image_tag contains characters invalid for an OCI image tag")
           pathlib.Path(os.environ["RUNNER_TEMP"], "bridge-patches.txt").write_text(
               "".join(patch.lower() + "\n" for patch in os.environ["BRIDGE_PATCH_SHAS"].split()),
+              encoding="utf-8",
+          )
+          pathlib.Path(os.environ["RUNNER_TEMP"], "sdk-patches.txt").write_text(
+              "".join(patch.lower() + "\n" for patch in patches),
               encoding="utf-8",
           )
           PY
@@ -106,18 +135,48 @@ jobs:
           artifact_dir="$RUNNER_TEMP/sdk-artifact"
           git init -q "$source_dir"
           git -C "$source_dir" remote add source https://github.com/Tralla/eufy-sdk.git
-          if ! git -C "$source_dir" fetch --no-tags source "$SDK_SHA"; then
-            echo "Could not fetch SDK commit from public source: $SDK_SHA" >&2
+          if ! git -C "$source_dir" fetch --no-tags source "$SDK_BASE_SHA"; then
+            echo "Could not fetch SDK base commit from public source: $SDK_BASE_SHA" >&2
             exit 1
           fi
-          if [[ "$(git -C "$source_dir" cat-file -t "$SDK_SHA")" != commit ]]; then
-            echo "SDK object is not a commit: $SDK_SHA" >&2
+          if [[ "$(git -C "$source_dir" cat-file -t "$SDK_BASE_SHA")" != commit ]]; then
+            echo "SDK base object is not a commit: $SDK_BASE_SHA" >&2
             exit 1
           fi
+          while IFS= read -r patch; do
+            [[ -n "$patch" ]] || continue
+            if ! git -C "$source_dir" fetch --no-tags source "$patch"; then
+              echo "Could not fetch SDK patch commit from public source: $patch" >&2
+              exit 1
+            fi
+            if [[ "$(git -C "$source_dir" cat-file -t "$patch")" != commit ]]; then
+              echo "SDK patch object is not a commit: $patch" >&2
+              exit 1
+            fi
+            parents="$(git -C "$source_dir" rev-list --parents -n 1 "$patch")"
+            if [[ "$(wc -w <<<"$parents")" -gt 2 ]]; then
+              echo "Merge commit is not a replayable SDK patch: $patch" >&2
+              exit 1
+            fi
+          done <"$RUNNER_TEMP/sdk-patches.txt"
           git -C "$source_dir" remote remove source
-          git -C "$source_dir" checkout --detach "$SDK_SHA"
-          [[ "$(git -C "$source_dir" rev-parse HEAD)" == "${SDK_SHA,,}" ]] || {
-            echo 'SDK checkout did not resolve to the requested commit' >&2
+          git -C "$source_dir" checkout --detach "$SDK_BASE_SHA"
+          git -C "$source_dir" config user.name 'github-actions[bot]'
+          git -C "$source_dir" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          while IFS= read -r patch; do
+            [[ -n "$patch" ]] || continue
+            if ! git -C "$source_dir" cherry-pick "$patch"; then
+              echo "SDK patch replay failed: $patch" >&2
+              exit 1
+            fi
+          done <"$RUNNER_TEMP/sdk-patches.txt"
+          actual_tree="$(git -C "$source_dir" rev-parse 'HEAD^{tree}')"
+          if [[ "$actual_tree" != "${SDK_CANDIDATE_TREE,,}" ]]; then
+            echo "Reconstructed SDK tree mismatch: expected $SDK_CANDIDATE_TREE, got $actual_tree" >&2
+            exit 1
+          fi
+          [[ "$(git -C "$source_dir" status --porcelain)" == '' ]] || {
+            echo 'Reconstructed SDK source is not clean before validation' >&2
             exit 1
           }
           npm ci --no-audit --no-fund --prefix "$source_dir"
@@ -249,7 +308,10 @@ jobs:
             --label "io.eufy.bridge.base=$BRIDGE_BASE_SHA" \
             --label "io.eufy.bridge.patch-shas=$BRIDGE_PATCH_PROVENANCE" \
             --label "io.eufy.bridge.candidate-tree=$BRIDGE_CANDIDATE_TREE" \
-            --label "io.eufy.sdk.sha=$SDK_SHA" \
+            --label "io.eufy.sdk.sha=$SDK_BASE_SHA" \
+            --label "io.eufy.sdk.patch-shas=$(paste -sd, \"$RUNNER_TEMP/sdk-patches.txt\")" \
+            --label "io.eufy.sdk.candidate-tree=$SDK_CANDIDATE_TREE" \
+            --label "io.eufy.sdk.patches-enabled=$SDK_PATCHES_ENABLED" \
             --label "io.eufy.sdk.version=$SDK_VERSION" \
             --push \
             "$RUNNER_TEMP/bridge-source"
