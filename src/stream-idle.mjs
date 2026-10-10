@@ -1,4 +1,6 @@
-// Battery-saving stream lifecycle. Keep a camera's P2P live feed only while it's worth streaming: if no
+import { onBatteryPower } from "./power.mjs";
+
+// Battery-saving stream lifecycle. Keep a BATTERY camera's P2P live feed only while it's worth streaming: if no
 // detection arrives for cfg.streamIdleMs, tear the feed down AND suspend reopening (go2rtc's ffmpeg
 // source then retries into a 503). The suspension lifts on the next detection OR once the consumer stops
 // pulling — so a stuck 24/7 consumer keeps the radio off while a viewer that returns is served at once.
@@ -69,7 +71,7 @@ export function createStreamIdle(ctx) {
     }
     for (const d of devices) {
       const sn = d.sn;
-      if (!(d.capabilities ?? []).includes("battery")) continue; // battery cameras only
+      if (!onBatteryPower(d.model, d.capabilities)) continue; // battery cameras only
       if (d.state?.rtspStream !== true) continue; // only if currently publishing
       if (activeStreams.has(sn)) {
         rtspLastActive.set(sn, now);
@@ -97,14 +99,20 @@ export function createStreamIdle(ctx) {
   function streamIdleTick() {
     if (!cfg.streamIdleMs) return;
     const now = Date.now();
-    // Auto-off any actively-pulled feed that has seen no detection for the whole idle window.
+    // Auto-off any actively-pulled BATTERY feed that has seen no detection for the whole idle window. A
+    // mains camera is left streaming: keeping it up costs no battery, and a continuous consumer (an NVR)
+    // would otherwise be cut off and held off by the suspension until the next motion.
     for (const [sn, st] of activeStreams) {
+      if (st.battery === false) continue;
       const lastSeen = Math.max(st.startedAt, lastDetect.get(sn) ?? 0);
       if (now - lastSeen >= cfg.streamIdleMs) {
         console.log(`[bridge] stream(${sn}) idle ${Math.round((now - lastSeen) / 1000)}s (no detection) — auto-off`);
         idleSuspended.add(sn);
         lastPullAttempt.set(sn, now); // it was being pulled right now; start the "consumer gave up" clock fresh
-        st.feed.destroy(); // fires the feed's cleanup, which drops it from activeStreams/streaming
+        // Close every open request for this camera, not only the one activeStreams shows: when ffmpeg's
+        // reconnect overlapped two, the other would keep streaming into the suspension. Each destroy fires
+        // that feed's cleanup, which drops it from activeStreams/streaming.
+        for (const entry of [...(st.peers ?? [st])]) entry.feed.destroy();
       }
     }
     // Lift a suspension once the consumer stops asking: go2rtc only pulls /stream while HA has a viewer,
