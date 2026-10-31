@@ -259,7 +259,10 @@ jobs:
           source_dir="$RUNNER_TEMP/bridge-source"
           cp "$SDK_ARTIFACT" "$source_dir/eufy-sdk-local.tgz"
           npm pkg set 'dependencies.@mega-yfue/eufy-sdk=file:./eufy-sdk-local.tgz' --prefix "$source_dir"
-          npm install --package-lock-only --ignore-scripts --no-audit --no-fund --prefix "$source_dir"
+          # npm 11.5.1 (bundled with Node 24.5.0) drops the lockfile "libc" fields when it rewrites the
+          # lock, so `npm ci` then installs both glibc and musl node-datachannel binaries and the
+          # Bridge WebRTC boot test fails. 11.19.0 keeps them.
+          npx --yes npm@11.19.0 install --package-lock-only --ignore-scripts --no-audit --no-fund --prefix "$source_dir"
           python3 - "$source_dir/Dockerfile" "$source_dir/Dockerfile.release" <<'PY'
           from pathlib import Path
           import sys
