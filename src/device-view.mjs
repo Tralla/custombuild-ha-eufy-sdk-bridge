@@ -1,4 +1,5 @@
 import { unobservableMembers } from "@mega-yfue/eufy-sdk";
+import { onBatteryPower } from "./power.mjs";
 // The host-facing view of a device: identity + capabilities + live property values + a stream path for
 // cameras. This is the shape the WS `devices.list` / `device.state` / `device.properties` commands and
 // the go2rtc camera registration both read, so a camera is "a device describeDevice gave a `stream`",
@@ -30,8 +31,12 @@ export function createDeviceView(ctx) {
       capabilities: m.capabilities,
       state: propertyState(dev), // live property values ({ battery: 74, motion: false, … })
       ...decodedReadings(dev, m),
+      ...liveness(m.sn), // availability facts a host turns into an online/offline verdict
       stream: isCamera ? `/stream/${m.sn}` : undefined,
       streaming: isCamera ? streaming.has(m.sn) : undefined, // live P2P feed active right now?
+      // "battery" | "wired", decided the way the SDK decides it (power.mjs): the `battery` capability alone
+      // also marks mains-only models.
+      power: isCamera ? (onBatteryPower(m.model, m.capabilities) ? "battery" : "wired") : undefined,
       canReboot: m.codec === "station", // HomeBase-only; drives a Reboot button in HA
     };
   }
@@ -40,6 +45,27 @@ export function createDeviceView(ctx) {
   function propertyState(dev) {
     const out = {};
     for (const [name, pv] of Object.entries(dev.getProperties())) out[name] = pv.value;
+    return out;
+  }
+
+  /**
+   * The SDK's honest liveness FACTS for a device — never an online/offline verdict, which is a
+   * per-device threshold the host owns (see the SDK's `DeviceState` doc). `availability` is the explicit
+   * vendor observation when one has been seen (authoritative); `lastSeenMs` is when the device last
+   * reported to the cloud. Both are omitted when the SDK has nothing — an older SDK, or a device that
+   * has never emitted the signal — so a host that relies on `state.deviceStatus` is unaffected.
+   */
+  function liveness(sn) {
+    const out = {};
+    const lastSeenMs = eufy.deviceState?.(sn)?.lastSeenMs;
+    if (typeof lastSeenMs === "number") out.lastSeenMs = lastSeenMs;
+    const availability = eufy.deviceAvailability?.(sn)?.availability;
+    if (availability === "available" || availability === "unavailable") out.availability = availability;
+    // A P2P session keyed by the device's OWN serial means a STANDALONE device with a live transport —
+    // proof it is reachable right now, even while it only sends transport keepalives and no param frames
+    // (so `lastSeenMs` stays put). A HomeBase-attached device's session is keyed by the HomeBase, not by
+    // the device, so this never fires for a child camera — a parent being up does not prove the child is.
+    if (eufy.getP2pSessions?.().get(sn)?.isConnected === true) out.p2pReachable = true;
     return out;
   }
 
@@ -111,6 +137,9 @@ export function createDeviceView(ctx) {
       unit: p.unit, // "%", "°C", "dBm", …
       kind: p.kind, // percent | celsius | dbm | seconds | …
       writable: p.writable, // a setter exists (device.set accepts it)
+      // whether the device has reported it (eufy-sdk 0.5+); false lets a host keep a never-reported
+      // read-only value out of view. Undefined on an older SDK, which a host treats as "unknown".
+      reported: p.reported,
       enumValues: p.enumValues, // { raw: label } for enums
       description: p.description,
     }));
